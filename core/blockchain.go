@@ -341,10 +341,6 @@ func (bc *BlockChain) loadLastState() error {
 	//		currentHeader = header
 	//	}
 	//}
-	utils.Logger().Info().
-		Str("number", currentBlock.Number().String()).
-		Str("hash", currentBlock.Hash().Hex()).
-		Msg("Head state missing, repairing chain")
 	currentHeader := currentBlock.Header()
 	bc.hc.SetCurrentHeader(currentHeader)
 
@@ -536,6 +532,7 @@ func (bc *BlockChain) ResetWithGenesisBlock(genesis *types.Block) error {
 // This method only rolls back the current block. The current header and current
 // fast block are left intact.
 func (bc *BlockChain) repair(head **types.Block) error {
+	valsToRemove := map[common.Address]struct{}{}
 	for {
 		// Abort if we've rewound to a head block that does have associated state
 		if _, err := state.New((*head).Root(), bc.stateCache); err == nil {
@@ -551,8 +548,41 @@ func (bc *BlockChain) repair(head **types.Block) error {
 		bc.WriteCommitSig((*head).NumberU64()-1, sigAndBitMap)
 
 		// Otherwise rewind one block and recheck state availability there
+		for _, stkTxn := range (*head).StakingTransactions() {
+			if stkTxn.StakingType() == staking.DirectiveCreateValidator {
+				if addr, err := stkTxn.SenderAddress(); err == nil {
+					valsToRemove[addr] = struct{}{}
+				} else {
+					return err
+				}
+			}
+		}
 		(*head) = bc.GetBlock((*head).ParentHash(), (*head).NumberU64()-1)
 	}
+	return bc.removeInValidatorList(valsToRemove)
+}
+
+// This func is used to remove the validator addresses from the validator list.
+func (bc *BlockChain) removeInValidatorList(toRemove map[common.Address]struct{}) error {
+	if len(toRemove) == 0 {
+		return nil
+	}
+	utils.Logger().Info().
+		Interface("validators", toRemove).
+		Msg("Removing validators from validator list")
+
+	existingVals, err := bc.ReadValidatorList()
+	if err != nil {
+		return err
+	}
+	newVals := []common.Address{}
+	for _, addr := range existingVals {
+		if _, ok := toRemove[addr]; !ok {
+			newVals = append(newVals, addr)
+		}
+	}
+	bc.WriteValidatorList(bc.db, newVals)
+	return nil
 }
 
 // Export writes the active chain to the given writer.
@@ -857,6 +887,7 @@ func (bc *BlockChain) Rollback(chain []common.Hash) {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
 
+	valsToRemove := map[common.Address]struct{}{}
 	for i := len(chain) - 1; i >= 0; i-- {
 		hash := chain[i]
 
@@ -879,9 +910,18 @@ func (bc *BlockChain) Rollback(chain []common.Hash) {
 			if newBlock != nil {
 				bc.currentBlock.Store(newBlock)
 				rawdb.WriteHeadBlockHash(bc.db, newBlock.Hash())
+
+				for _, stkTxn := range currentBlock.StakingTransactions() {
+					if stkTxn.StakingType() == staking.DirectiveCreateValidator {
+						if addr, err := stkTxn.SenderAddress(); err == nil {
+							valsToRemove[addr] = struct{}{}
+						}
+					}
+				}
 			}
 		}
 	}
+	bc.removeInValidatorList(valsToRemove)
 }
 
 // SetReceiptsData computes all the non-consensus fields of the receipts
@@ -2313,6 +2353,22 @@ func (bc *BlockChain) UpdateValidatorVotingPower(
 			}
 		}
 		stats.MetricsPerShard = earningWrapping
+
+		// fetch raw-stake from snapshot and update per-key metrics
+		if snapshot, err := bc.ReadValidatorSnapshotAtEpoch(
+			newEpochSuperCommittee.Epoch, key,
+		); err == nil {
+			wrapper := snapshot.Validator
+			spread := numeric.ZeroDec()
+			if len(wrapper.SlotPubKeys) > 0 {
+				spread = numeric.NewDecFromBigInt(wrapper.TotalDelegation()).
+					QuoInt64(int64(len(wrapper.SlotPubKeys)))
+			}
+			for i := range stats.MetricsPerShard {
+				metric := stats.MetricsPerShard[i]
+				metric.Vote.RawStake = spread
+			}
+		}
 
 		// This means it's already in staking epoch
 		if currentEpochSuperCommittee.Epoch != nil {
